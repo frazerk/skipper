@@ -1,60 +1,150 @@
 use std::env;
 
 type Args = [String];
-type Run<'a> = Box<dyn FnMut(&Args) + 'a>;
 
-pub struct Command<'a> {
-    pub name: &'a str,
-    pub subcommands: Vec<CommandRun<'a>>,
+pub trait Execute {
+    fn execute(self, args: &Args) -> bool;
 }
 
-impl<'a> Command<'a> {
-    pub fn run<F>(self, f: F) -> CommandRun<'a>
+pub trait Traverse {
+    fn traverse(self, child: impl Execute);
+
+    fn subcommand<F>(self, name: &str, run: F) -> SubTraverse<Self, F>
     where
-        F: 'a + FnMut(&Args),
+        Self: Sized,
+        F: FnOnce(&Args),
     {
-        CommandRun {
-            command: self,
-            run: Box::new(f),
+        SubTraverse {
+            name: name.into(),
+            parent: self,
+            run,
         }
     }
 }
 
-pub struct CommandRun<'a> {
-    command: Command<'a>,
-    run: Box<dyn FnMut(&Args) + 'a>,
+pub struct App<F>
+where
+    F: FnOnce(&Args),
+{
+    name: String,
+    run: F,
+
+    // TODO: Come up with better way of injecting this
+    args: Vec<String>,
 }
 
-impl<'a> CommandRun<'a> {
-    pub fn execute(&mut self) {
-        let args: Vec<String> = env::args().skip(1).collect();
-        self.execute_args(&args);
-    }
-
-    fn execute_args(&mut self, args: &Args) {
-        match self.find(args) {
-            Some((r, a)) => (r)(a),
-            None => println!("ERROR: no command found"),
+impl<F> Traverse for App<F>
+where
+    F: FnOnce(&Args),
+{
+    fn traverse(self, child: impl Execute) {
+        match self.args.as_slice() {
+            // If we don't have any arguments, execute the root regardless of the presence of
+            // subcommands.
+            a @ [] => {
+                (self.run)(a);
+            }
+            // If we do have subcommands, only execute the root if none of the subcommands
+            // matched.
+            a @ [..] => {
+                if !child.execute(a) {
+                    (self.run)(a);
+                }
+            }
         }
     }
+}
 
-    fn find<'b>(&mut self, args: &'b Args) -> Option<(&mut Run<'a>, &'b [String])> {
-        if args.is_empty() {
-            return Some((&mut self.run, args));
+pub struct SubTraverse<P, F>
+where
+    P: Traverse,
+    F: FnOnce(&Args),
+{
+    parent: P,
+    run: F,
+    name: String,
+}
+
+impl<P, F> Traverse for SubTraverse<P, F>
+where
+    P: Traverse,
+    F: FnOnce(&Args),
+{
+    fn traverse(self, child: impl Execute) {
+        self.parent.traverse(SubCommand {
+            run: self.run,
+            name: self.name,
+            sub: child,
+        });
+    }
+}
+
+pub struct SubCommand<F, S> {
+    run: F,
+    name: String,
+    sub: S,
+}
+
+impl<F, S> Execute for SubCommand<F, S>
+where
+    F: FnOnce(&Args),
+    S: Execute,
+{
+    fn execute(self, args: &Args) -> bool {
+        match args {
+            // If there aren't any arguments, we don't match.
+            [] => false,
+
+            // TODO: clean this up, jesus christ
+            [first, a @ ..] => {
+                if first == &self.name {
+                    if !self.sub.execute(a) {
+                        (self.run)(a);
+                    }
+
+                    true
+                } else {
+                    false
+                }
+            }
         }
+    }
+}
 
-        let next_sub = &args[0];
+pub struct SubCommandSet {}
 
-        let found = self
-            .command
-            .subcommands
-            .iter_mut()
-            .find(|sc| sc.command.name == next_sub);
+pub struct Command<F>
+where
+    F: FnOnce(&Args),
+{
+    name: String,
+    run: F,
+}
 
-        match found {
-            Some(sc) => sc.find(&args[1..]),
-            None => Some((&mut self.run, args)),
+impl<F> Execute for Command<F>
+where
+    F: FnOnce(&Args),
+{
+    fn execute(self, args: &Args) -> bool {
+        match args {
+            [] => false,
+            [first, a @ ..] => {
+                if first == &self.name {
+                    (self.run)(a);
+                    true
+                } else {
+                    false
+                }
+            }
         }
+    }
+}
+
+pub struct NullCommand {}
+
+impl Execute for NullCommand {
+    fn execute(self, _: &Args) -> bool {
+        false
     }
 }
 
@@ -68,16 +158,16 @@ mod tests {
 
     #[test]
     fn no_subcommands_no_flags() {
-        let run = |args: &Vec<String>| {
+        let run = |args: Vec<String>| {
             let mut captured: Option<Vec<String>> = None;
 
-            let mut cmd = Command {
-                name: "first",
-                subcommands: vec![],
-            }
-            .run(|a| captured = Some(a.to_vec()));
-            cmd.execute_args(args);
-            drop(cmd);
+            let cmd = App {
+                name: "first".into(),
+                run: |a| captured = Some(a.to_vec()),
+                args,
+            };
+
+            cmd.traverse(NullCommand {});
 
             captured
         };
@@ -91,7 +181,8 @@ mod tests {
         ];
 
         for a in args {
-            let captured = run(&a);
+            // TODO: get rid of this clone
+            let captured = run(a.clone());
 
             // If we have a single command and no subcommands or flags, all arguments
             // must be passed to the top-level command.
@@ -101,21 +192,18 @@ mod tests {
 
     #[test]
     fn one_level_subcommand_no_flags() {
-        let run = |args: &Vec<String>| {
+        let run = |args: Vec<String>| {
             let mut captured_first: Option<Vec<String>> = None;
             let mut captured_second: Option<Vec<String>> = None;
 
-            let mut cmd = Command {
-                name: "first",
-                subcommands: vec![Command {
-                    name: "second",
-                    subcommands: vec![],
-                }
-                .run(|a| captured_second = Some(a.to_vec()))],
+            let cmd = App {
+                name: "first".into(),
+                run: |a| captured_first = Some(a.to_vec()),
+                args,
             }
-            .run(|a| captured_first = Some(a.to_vec()));
-            cmd.execute_args(args);
-            drop(cmd);
+            .subcommand("second", |a| captured_second = Some(a.to_vec()));
+
+            cmd.traverse(NullCommand {});
 
             (captured_first, captured_second)
         };
@@ -128,7 +216,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second) = run(&a);
+            let (captured_first, captured_second) = run(a.clone());
 
             assert!(
                 captured_first.is_none(),
@@ -151,7 +239,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second) = run(&a);
+            let (captured_first, captured_second) = run(a.clone());
 
             assert!(
                 captured_second.is_none(),
@@ -172,22 +260,15 @@ mod tests {
             let mut captured_second: Option<Vec<String>> = None;
             let mut captured_third: Option<Vec<String>> = None;
 
-            let mut cmd = Command {
-                name: "first",
-                subcommands: vec![Command {
-                    name: "second",
-                    subcommands: vec![Command {
-                        name: "third",
-                        subcommands: vec![],
-                    }
-                    .run(|a| captured_third = Some(a.to_vec()))],
-                }
-                .run(|a| captured_second = Some(a.to_vec()))],
+            let cmd = App {
+                name: "first".into(),
+                run: |a| captured_first = Some(a.to_vec()),
+                args: args.clone(),
             }
-            .run(|a| captured_first = Some(a.to_vec()));
+            .subcommand("second", |a| captured_second = Some(a.to_vec()))
+            .subcommand("third", |a| captured_third = Some(a.to_vec()));
 
-            cmd.execute_args(args);
-            drop(cmd);
+            cmd.traverse(NullCommand {});
 
             (captured_first, captured_second, captured_third)
         };
