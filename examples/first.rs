@@ -1,18 +1,19 @@
-use skipper::Command;
+use skipper::*;
 
 fn main() {
-    let a = 1;
+    let mut a = 1;
 
-    Command {
-        name: "first",
-        subcommands: vec![Command {
-            name: "second",
-            subcommands: vec![],
-        }
-        .run(|i| println!("2 {} {}", i.join("/"), a))],
-    }
-    .run(first)
-    .execute();
+    App::new("first")
+        .run(first)
+        .sub(
+            Cmd::new("second")
+                .run(|i| {
+                    a += 1;
+                    println!("2 {} {}", i.join("/"), a)
+                })
+                .sub(Cmd::new("third").run(|i| println!("3 {}", i.join("-")))),
+        )
+        .execute();
 }
 
 fn first(args: &[String]) {

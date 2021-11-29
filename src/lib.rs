@@ -2,148 +2,235 @@ use std::env;
 
 type Args = [String];
 
-pub trait Execute {
-    fn execute(self, args: &Args) -> bool;
+const LEAF: Option<NullCmd> = None;
+
+// TODO: find better name for this
+pub trait Exec {
+    fn exec(self, args: &Args) -> bool;
 }
 
-pub trait Traverse {
-    fn traverse(self, child: impl Execute);
+pub trait Traverse
+where
+    Self: Sized,
+{
+    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool;
 
-    fn subcommand<F>(self, name: &str, run: F) -> SubTraverse<Self, F>
+    fn sub<S>(self, sub: S) -> SubTraverse<Self, S>
     where
-        Self: Sized,
-        F: FnOnce(&Args),
+        S: Exec,
     {
-        SubTraverse {
-            name: name.into(),
-            parent: self,
-            run,
+        SubTraverse { prev: self, sub }
+    }
+
+    fn execute(self) {
+        let args: Vec<String> = env::args().skip(1).collect();
+        self.execute_with(&args)
+    }
+
+    fn execute_with(self, args: &Args) {
+        self.traverse(args, LEAF);
+    }
+}
+
+pub struct App<'a, F>
+where
+    F: FnOnce(&Args),
+{
+    name: &'a str,
+    run: Option<F>,
+}
+
+// TODO: should we have a separate builder?
+impl<'a, F> App<'a, F>
+where
+    F: FnOnce(&Args),
+{
+    pub fn new(name: &'a str) -> Self {
+        Self { name, run: None }
+    }
+
+    pub fn run(mut self, run: F) -> Self {
+        self.run = Some(run);
+        self
+    }
+}
+
+impl<F> Traverse for App<'_, F>
+where
+    F: FnOnce(&Args),
+{
+    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool {
+        println!("APP TRAVERSE: {:?}", args);
+        // TODO: remove duplication
+        match (args, self.run, next) {
+            // If we don't have subcommands or there are no arguments, just execute ourselves.
+            (a @ [..], Some(run), None) | (a @ [], Some(run), Some(_)) => {
+                println!("RUNNING APP");
+                run(a);
+            }
+
+            // If we do have subcommands, only execute the root if none of the subcommands
+            // matched.
+            (a @ [..], Some(run), Some(next)) => {
+                if !next.exec(a) {
+                    println!("RUNNING APP");
+                    run(a);
+                }
+            }
+
+            // If we do have subcommands, only execute the root if none of the subcommands
+            // matched.
+            (a @ [..], None, Some(next)) => {
+                next.exec(a);
+            }
+
+            _ => (),
+        }
+
+        true
+    }
+}
+
+pub struct Cmd<'a, F>
+where
+    F: FnOnce(&Args),
+{
+    name: &'a str,
+    run: Option<F>,
+}
+
+// TODO: duplication with App
+impl<'a, F> Cmd<'a, F>
+where
+    F: FnOnce(&Args),
+{
+    pub fn new(name: &'a str) -> Self {
+        Self { name, run: None }
+    }
+
+    pub fn run(mut self, run: F) -> Self {
+        self.run = Some(run);
+        self
+    }
+
+    // TODO: better name
+    fn go(self, args: &Args) {
+        if let Some(run) = self.run {
+            run(args);
         }
     }
 }
 
-pub struct App<F>
+impl<F> Exec for Cmd<'_, F>
 where
     F: FnOnce(&Args),
 {
-    name: String,
-    run: F,
-
-    // TODO: Come up with better way of injecting this
-    args: Vec<String>,
-}
-
-impl<F> Traverse for App<F>
-where
-    F: FnOnce(&Args),
-{
-    fn traverse(self, child: impl Execute) {
-        match self.args.as_slice() {
-            // If we don't have any arguments, execute the root regardless of the presence of
-            // subcommands.
-            a @ [] => {
-                (self.run)(a);
-            }
-            // If we do have subcommands, only execute the root if none of the subcommands
-            // matched.
-            a @ [..] => {
-                if !child.execute(a) {
-                    (self.run)(a);
+    fn exec(self, args: &Args) -> bool {
+        // TODO: remove duplication with traverse
+        match args {
+            [] => false,
+            [first, a @ ..] => {
+                if first == self.name {
+                    self.go(a);
+                    true
+                } else {
+                    false
                 }
             }
         }
     }
 }
 
-pub struct SubTraverse<P, F>
+impl<F> Traverse for Cmd<'_, F>
 where
-    P: Traverse,
     F: FnOnce(&Args),
 {
-    parent: P,
-    run: F,
-    name: String,
-}
+    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool {
+        println!("COMMAND TRAVERSE: {:?}", args);
 
-impl<P, F> Traverse for SubTraverse<P, F>
-where
-    P: Traverse,
-    F: FnOnce(&Args),
-{
-    fn traverse(self, child: impl Execute) {
-        self.parent.traverse(SubCommand {
-            run: self.run,
-            name: self.name,
-            sub: child,
-        });
+        // TODO: remove duplication
+        match (args, next) {
+            // If we don't have arguments, neither we nor our subcommands should execute.
+            ([], _) => false,
+
+            ([first, a @ ..], Some(next)) if first == self.name => {
+                if next.exec(a) {
+                    true
+                } else {
+                    self.exec(args)
+                }
+            }
+
+            ([first, ..], None) if first == self.name => self.exec(args),
+
+            _ => false,
+        }
     }
 }
 
-pub struct SubCommand<F, S> {
-    run: F,
-    name: String,
+pub struct SubTraverse<P, S>
+where
+    P: Traverse,
+    S: Exec,
+{
+    prev: P,
     sub: S,
 }
 
-impl<F, S> Execute for SubCommand<F, S>
+impl<P, S> Traverse for SubTraverse<P, S>
 where
-    F: FnOnce(&Args),
-    S: Execute,
+    P: Traverse,
+    S: Exec,
 {
-    fn execute(self, args: &Args) -> bool {
-        match args {
-            // If there aren't any arguments, we don't match.
-            [] => false,
+    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool {
+        println!("SUBTRAVERSE TRAVERSE: {:?}", args);
+        self.prev.traverse(
+            args,
+            Some(SubCommand {
+                exec: self.sub,
+                next,
+            }),
+        )
+    }
+}
 
-            // TODO: clean this up, jesus christ
-            [first, a @ ..] => {
-                if first == &self.name {
-                    if !self.sub.execute(a) {
-                        (self.run)(a);
-                    }
+impl<P, S> Exec for SubTraverse<P, S>
+where
+    P: Traverse,
+    S: Exec,
+{
+    fn exec(self, args: &Args) -> bool {
+        self.traverse(args, LEAF)
+    }
+}
 
-                    true
-                } else {
-                    false
-                }
-            }
+pub struct SubCommand<E, S> {
+    exec: E,
+    next: Option<S>,
+}
+
+impl<E, S> Exec for SubCommand<E, S>
+where
+    E: Exec,
+    S: Exec,
+{
+    fn exec(self, args: &Args) -> bool {
+        // TODO: is this order right?
+        if self.exec.exec(args) {
+            true
+        } else if let Some(next) = self.next {
+            next.exec(args)
+        } else {
+            false
         }
     }
 }
 
-pub struct SubCommandSet {}
+// TODO: get rid of this
+pub struct NullCmd {}
 
-pub struct Command<F>
-where
-    F: FnOnce(&Args),
-{
-    name: String,
-    run: F,
-}
-
-impl<F> Execute for Command<F>
-where
-    F: FnOnce(&Args),
-{
-    fn execute(self, args: &Args) -> bool {
-        match args {
-            [] => false,
-            [first, a @ ..] => {
-                if first == &self.name {
-                    (self.run)(a);
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-}
-
-pub struct NullCommand {}
-
-impl Execute for NullCommand {
-    fn execute(self, _: &Args) -> bool {
+impl Exec for NullCmd {
+    fn exec(self, _: &Args) -> bool {
         false
     }
 }
@@ -158,16 +245,12 @@ mod tests {
 
     #[test]
     fn no_subcommands_no_flags() {
-        let run = |args: Vec<String>| {
+        let run = |args: &[String]| {
             let mut captured: Option<Vec<String>> = None;
 
-            let cmd = App {
-                name: "first".into(),
-                run: |a| captured = Some(a.to_vec()),
-                args,
-            };
-
-            cmd.traverse(NullCommand {});
+            App::new("first")
+                .run(|a| captured = Some(a.to_vec()))
+                .execute_with(args);
 
             captured
         };
@@ -182,7 +265,7 @@ mod tests {
 
         for a in args {
             // TODO: get rid of this clone
-            let captured = run(a.clone());
+            let captured = run(&a);
 
             // If we have a single command and no subcommands or flags, all arguments
             // must be passed to the top-level command.
@@ -191,21 +274,26 @@ mod tests {
     }
 
     #[test]
-    fn one_level_subcommand_no_flags() {
-        let run = |args: Vec<String>| {
+    fn one_level_subcommands_no_flags() {
+        let run = |args: &[String]| {
             let mut captured_first: Option<Vec<String>> = None;
             let mut captured_second: Option<Vec<String>> = None;
+            let mut captured_third: Option<Vec<String>> = None;
+            let mut captured_fourth: Option<Vec<String>> = None;
 
-            let cmd = App {
-                name: "first".into(),
-                run: |a| captured_first = Some(a.to_vec()),
-                args,
-            }
-            .subcommand("second", |a| captured_second = Some(a.to_vec()));
+            App::new("first")
+                .run(|a| captured_first = Some(a.to_vec()))
+                .sub(Cmd::new("second").run(|a| captured_second = Some(a.to_vec())))
+                .sub(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
+                .sub(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec())))
+                .execute_with(args);
 
-            cmd.traverse(NullCommand {});
-
-            (captured_first, captured_second)
+            (
+                captured_first,
+                captured_second,
+                captured_third,
+                captured_fourth,
+            )
         };
 
         let args = vec![
@@ -216,13 +304,90 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second) = run(a.clone());
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
 
             assert!(
                 captured_first.is_none(),
                 "should not have run the outer command"
             );
+
+            assert!(
+                captured_third.is_none(),
+                "should not have run the third command"
+            );
+
+            assert!(
+                captured_fourth.is_none(),
+                "should not have run the fourth command"
+            );
+
             let c = captured_second.expect("subcommand should have run");
+            assert_eq!(
+                c,
+                &a[1..],
+                "arguments after the name of the subcommand must be passed to the subcommand"
+            );
+        }
+
+        let args = vec![
+            owned(&["third", "one"]),
+            owned(&["third", "one", "two"]),
+            owned(&["third", "one", "two", "three"]),
+            owned(&["third", "one", "two", "three", "four"]),
+        ];
+
+        for a in args {
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+
+            assert!(
+                captured_first.is_none(),
+                "should not have run the outer command"
+            );
+
+            assert!(
+                captured_second.is_none(),
+                "should not have run the third command"
+            );
+
+            assert!(
+                captured_fourth.is_none(),
+                "should not have run the fourth command"
+            );
+
+            let c = captured_third.expect("subcommand should have run");
+            assert_eq!(
+                c,
+                &a[1..],
+                "arguments after the name of the subcommand must be passed to the subcommand"
+            );
+        }
+
+        let args = vec![
+            owned(&["fourth", "one"]),
+            owned(&["fourth", "one", "two"]),
+            owned(&["fourth", "one", "two", "three"]),
+            owned(&["fourth", "one", "two", "three", "four"]),
+        ];
+
+        for a in args {
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+
+            assert!(
+                captured_first.is_none(),
+                "should not have run the outer command"
+            );
+
+            assert!(
+                captured_second.is_none(),
+                "should not have run the third command"
+            );
+
+            assert!(
+                captured_third.is_none(),
+                "should not have run the third command"
+            );
+
+            let c = captured_fourth.expect("subcommand should have run");
             assert_eq!(
                 c,
                 &a[1..],
@@ -239,38 +404,55 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second) = run(a.clone());
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
 
-            assert!(
-                captured_second.is_none(),
-                "should not have run the subcommand"
-            );
             assert_eq!(
                 captured_first,
                 Some(a),
                 "all arguments should have been passed to first command"
+            );
+
+            assert!(
+                captured_second.is_none(),
+                "should not have run the second command"
+            );
+
+            assert!(
+                captured_third.is_none(),
+                "should not have run the third command"
+            );
+
+            assert!(
+                captured_fourth.is_none(),
+                "should not have run the fourth command"
             );
         }
     }
 
     #[test]
     fn two_level_subcommand_no_flags() {
-        let run = |args: &Vec<String>| {
+        let run = |args: &[String]| {
             let mut captured_first: Option<Vec<String>> = None;
             let mut captured_second: Option<Vec<String>> = None;
             let mut captured_third: Option<Vec<String>> = None;
+            let mut captured_fourth: Option<Vec<String>> = None;
 
-            let cmd = App {
-                name: "first".into(),
-                run: |a| captured_first = Some(a.to_vec()),
-                args: args.clone(),
-            }
-            .subcommand("second", |a| captured_second = Some(a.to_vec()))
-            .subcommand("third", |a| captured_third = Some(a.to_vec()));
+            App::new("first")
+                .run(|a| captured_first = Some(a.to_vec()))
+                .sub(
+                    Cmd::new("second")
+                        .run(|a| captured_second = Some(a.to_vec()))
+                        .sub(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
+                        .sub(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec()))),
+                )
+                .execute_with(args);
 
-            cmd.traverse(NullCommand {});
-
-            (captured_first, captured_second, captured_third)
+            (
+                captured_first,
+                captured_second,
+                captured_third,
+                captured_fourth,
+            )
         };
 
         let args = vec![
@@ -281,7 +463,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
 
             assert!(
                 captured_first.is_none(),
@@ -291,7 +473,41 @@ mod tests {
                 captured_second.is_none(),
                 "should not have run the first subcommand"
             );
+            assert!(
+                captured_fourth.is_none(),
+                "should not have run the fourth subcommand"
+            );
             let c = captured_third.expect("subcommand should have run");
+            assert_eq!(
+                c,
+                &a[2..],
+                "arguments after the name of the subcommand must be passed to the subcommand"
+            );
+        }
+
+        let args = vec![
+            owned(&["second", "fourth", "one"]),
+            owned(&["second", "fourth", "one", "two"]),
+            owned(&["second", "fourth", "one", "two", "three"]),
+            owned(&["second", "fourth", "one", "two", "three", "four"]),
+        ];
+
+        for a in args {
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+
+            assert!(
+                captured_first.is_none(),
+                "should not have run the outer command"
+            );
+            assert!(
+                captured_second.is_none(),
+                "should not have run the first subcommand"
+            );
+            assert!(
+                captured_third.is_none(),
+                "should not have run the third subcommand"
+            );
+            let c = captured_fourth.expect("subcommand should have run");
             assert_eq!(
                 c,
                 &a[2..],
@@ -307,7 +523,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
 
             assert!(
                 captured_first.is_none(),
@@ -315,6 +531,10 @@ mod tests {
             );
             assert!(
                 captured_third.is_none(),
+                "should not have run the innermost subcommand"
+            );
+            assert!(
+                captured_fourth.is_none(),
                 "should not have run the innermost subcommand"
             );
             let c = captured_second.expect("subcommand should have run");
@@ -334,7 +554,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
 
             assert!(
                 captured_second.is_none(),
@@ -343,6 +563,10 @@ mod tests {
             assert!(
                 captured_third.is_none(),
                 "should not have run the innermost subcommand"
+            );
+            assert!(
+                captured_fourth.is_none(),
+                "should not have run the fourth subcommand"
             );
             assert_eq!(
                 captured_first,
