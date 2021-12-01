@@ -2,236 +2,185 @@ use std::env;
 
 type Args = [String];
 
-const LEAF: Option<NullCmd> = None;
+pub trait Visitor {
+    // TODO: rename
+    fn exec(&mut self, args: &Args) -> bool;
 
-// TODO: find better name for this
-pub trait Exec {
-    fn exec(self, args: &Args) -> bool;
-}
-
-pub trait Traverse
-where
-    Self: Sized,
-{
-    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool;
-
-    fn sub<S>(self, sub: S) -> SubTraverse<Self, S>
-    where
-        S: Exec,
-    {
-        SubTraverse { prev: self, sub }
-    }
-
-    fn execute(self) {
-        let args: Vec<String> = env::args().skip(1).collect();
+    fn execute(&mut self) {
+        let args: Vec<String> = env::args().collect();
         self.execute_with(&args)
     }
 
-    fn execute_with(self, args: &Args) {
-        self.traverse(args, LEAF);
+    fn execute_with(&mut self, args: &Args) {
+        self.exec(args);
     }
 }
 
-pub struct App<'a, F>
-where
-    F: FnOnce(&Args),
-{
+#[derive(Default)]
+struct Data<'a> {
     name: &'a str,
-    run: Option<F>,
+    description: Option<&'a str>,
+
+    // TODO: this is ugly as sin
+    root: bool,
 }
 
-// TODO: should we have a separate builder?
-impl<'a, F> App<'a, F>
-where
-    F: FnOnce(&Args),
-{
-    pub fn new(name: &'a str) -> Self {
-        Self { name, run: None }
-    }
-
-    pub fn run(mut self, run: F) -> Self {
-        self.run = Some(run);
-        self
-    }
+pub struct Cmd<'a, F, N> {
+    run: F,
+    next: N,
+    data: Data<'a>,
 }
 
-impl<F> Traverse for App<'_, F>
-where
-    F: FnOnce(&Args),
-{
-    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool {
-        println!("APP TRAVERSE: {:?}", args);
-        // TODO: remove duplication
-        match (args, self.run, next) {
-            // If we don't have subcommands or there are no arguments, just execute ourselves.
-            (a @ [..], Some(run), None) | (a @ [], Some(run), Some(_)) => {
-                println!("RUNNING APP");
-                run(a);
-            }
-
-            // If we do have subcommands, only execute the root if none of the subcommands
-            // matched.
-            (a @ [..], Some(run), Some(next)) => {
-                if !next.exec(a) {
-                    println!("RUNNING APP");
-                    run(a);
-                }
-            }
-
-            // If we do have subcommands, only execute the root if none of the subcommands
-            // matched.
-            (a @ [..], None, Some(next)) => {
-                next.exec(a);
-            }
-
-            _ => (),
+impl<'a, F, N> Cmd<'a, F, N> {
+    pub fn run<G>(self, run: G) -> Cmd<'a, G, N>
+    where
+        G: FnMut(&Args),
+    {
+        Cmd {
+            run,
+            next: self.next,
+            data: self.data,
         }
-
-        true
-    }
-}
-
-pub struct Cmd<'a, F>
-where
-    F: FnOnce(&Args),
-{
-    name: &'a str,
-    run: Option<F>,
-}
-
-// TODO: duplication with App
-impl<'a, F> Cmd<'a, F>
-where
-    F: FnOnce(&Args),
-{
-    pub fn new(name: &'a str) -> Self {
-        Self { name, run: None }
     }
 
-    pub fn run(mut self, run: F) -> Self {
-        self.run = Some(run);
+    // TODO: find shorter name (sub conflicts with common trait)
+    pub fn subcommand<V: Visitor>(self, sub: V) -> Cmd<'a, F, Chain<V, N>> {
+        Cmd {
+            next: Chain {
+                cur: sub,
+                next: self.next,
+            },
+            run: self.run,
+            data: self.data,
+        }
+    }
+
+    pub fn description(mut self, description: &'a str) -> Self {
+        self.data.description = Some(description);
         self
     }
 
-    // TODO: better name
-    fn go(self, args: &Args) {
-        if let Some(run) = self.run {
-            run(args);
-        }
-    }
-}
-
-impl<F> Exec for Cmd<'_, F>
-where
-    F: FnOnce(&Args),
-{
-    fn exec(self, args: &Args) -> bool {
-        // TODO: remove duplication with traverse
+    fn check_run<'b>(&self, args: &'b Args) -> Option<&'b Args> {
         match args {
-            [] => false,
+            [] => None,
             [first, a @ ..] => {
-                if first == self.name {
-                    self.go(a);
-                    true
+                if first == self.data.name || self.data.root {
+                    Some(a)
                 } else {
-                    false
+                    None
                 }
             }
         }
     }
 }
 
-impl<F> Traverse for Cmd<'_, F>
+impl<'a, F, N> Visitor for Cmd<'a, F, N>
 where
-    F: FnOnce(&Args),
+    F: FnMut(&Args), // TODO: can we get this to be FnOnce?
+    N: Visitor,
 {
-    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool {
-        println!("COMMAND TRAVERSE: {:?}", args);
-
-        // TODO: remove duplication
-        match (args, next) {
-            // If we don't have arguments, neither we nor our subcommands should execute.
-            ([], _) => false,
-
-            ([first, a @ ..], Some(next)) if first == self.name => {
-                if next.exec(a) {
-                    true
-                } else {
-                    self.exec(args)
+    fn exec(&mut self, args: &Args) -> bool {
+        match self.check_run(args) {
+            Some(args) => {
+                if !self.next.exec(args) {
+                    (self.run)(args);
                 }
+                true
             }
-
-            ([first, ..], None) if first == self.name => self.exec(args),
-
-            _ => false,
+            None => false,
         }
     }
 }
 
-pub struct SubTraverse<P, S>
+impl<'a, F> Visitor for Cmd<'a, F, ()>
 where
-    P: Traverse,
-    S: Exec,
+    F: FnMut(&Args), // TODO: can we get this to be FnOnce?,
 {
-    prev: P,
-    sub: S,
-}
-
-impl<P, S> Traverse for SubTraverse<P, S>
-where
-    P: Traverse,
-    S: Exec,
-{
-    fn traverse<E: Exec>(self, args: &Args, next: Option<E>) -> bool {
-        println!("SUBTRAVERSE TRAVERSE: {:?}", args);
-        self.prev.traverse(
-            args,
-            Some(SubCommand {
-                exec: self.sub,
-                next,
-            }),
-        )
+    fn exec(&mut self, args: &Args) -> bool {
+        match self.check_run(args) {
+            Some(args) => {
+                (self.run)(args);
+                true
+            }
+            None => false,
+        }
     }
 }
 
-impl<P, S> Exec for SubTraverse<P, S>
+impl<'a, N> Visitor for Cmd<'a, (), N>
 where
-    P: Traverse,
-    S: Exec,
+    N: Visitor,
 {
-    fn exec(self, args: &Args) -> bool {
-        self.traverse(args, LEAF)
+    fn exec(&mut self, args: &Args) -> bool {
+        match self.check_run(args) {
+            Some(args) => {
+                self.next.exec(args);
+                true
+            }
+            None => false,
+        }
     }
 }
 
-pub struct SubCommand<E, S> {
-    exec: E,
-    next: Option<S>,
+impl<'a> Visitor for Cmd<'a, (), ()> {
+    fn exec(&mut self, args: &Args) -> bool {
+        self.check_run(args).is_some()
+    }
 }
 
-impl<E, S> Exec for SubCommand<E, S>
+impl<'a> Cmd<'a, (), ()> {
+    pub fn new(name: &'a str) -> Self {
+        Self {
+            run: (),
+            next: (),
+            data: Data {
+                name,
+                ..Data::default()
+            },
+        }
+    }
+
+    pub fn root(name: &'a str) -> Self {
+        Self {
+            run: (),
+            next: (),
+            data: Data {
+                name,
+                root: true,
+                ..Data::default()
+            },
+        }
+    }
+}
+
+pub struct Chain<C, N>
 where
-    E: Exec,
-    S: Exec,
+    C: Visitor,
 {
-    fn exec(self, args: &Args) -> bool {
-        // TODO: is this order right?
-        if self.exec.exec(args) {
+    cur: C,
+    next: N,
+}
+
+impl<C, N> Visitor for Chain<C, N>
+where
+    C: Visitor,
+    N: Visitor,
+{
+    fn exec(&mut self, args: &Args) -> bool {
+        if self.cur.exec(args) {
             true
-        } else if let Some(next) = self.next {
-            next.exec(args)
         } else {
-            false
+            self.next.exec(args)
         }
     }
 }
 
-// TODO: get rid of this
-pub struct NullCmd {}
-
-impl Exec for NullCmd {
-    fn exec(self, _: &Args) -> bool {
-        false
+impl<C> Visitor for Chain<C, ()>
+where
+    C: Visitor,
+{
+    fn exec(&mut self, args: &Args) -> bool {
+        self.cur.exec(args)
     }
 }
 
@@ -248,7 +197,7 @@ mod tests {
         let run = |args: &[String]| {
             let mut captured: Option<Vec<String>> = None;
 
-            App::new("first")
+            Cmd::root("first")
                 .run(|a| captured = Some(a.to_vec()))
                 .execute_with(args);
 
@@ -256,11 +205,11 @@ mod tests {
         };
 
         let args = vec![
-            owned(&[]),
-            owned(&["one"]),
-            owned(&["one", "two"]),
-            owned(&["one", "two", "three"]),
-            owned(&["one", "two", "three", "four"]),
+            owned(&["first"]),
+            owned(&["first", "one"]),
+            owned(&["first", "one", "two"]),
+            owned(&["first", "one", "two", "three"]),
+            owned(&["first", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -269,7 +218,13 @@ mod tests {
 
             // If we have a single command and no subcommands or flags, all arguments
             // must be passed to the top-level command.
-            assert_eq!(captured, Some(a));
+            let c = captured.expect("command should have run");
+
+            assert_eq!(
+                c,
+                a[1..],
+                "arguments after the name of the command must be passed to run"
+            );
         }
     }
 
@@ -281,11 +236,11 @@ mod tests {
             let mut captured_third: Option<Vec<String>> = None;
             let mut captured_fourth: Option<Vec<String>> = None;
 
-            App::new("first")
+            Cmd::root("first")
                 .run(|a| captured_first = Some(a.to_vec()))
-                .sub(Cmd::new("second").run(|a| captured_second = Some(a.to_vec())))
-                .sub(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
-                .sub(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec())))
+                .subcommand(Cmd::new("second").run(|a| captured_second = Some(a.to_vec())))
+                .subcommand(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
+                .subcommand(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec())))
                 .execute_with(args);
 
             (
@@ -297,10 +252,10 @@ mod tests {
         };
 
         let args = vec![
-            owned(&["second", "one"]),
-            owned(&["second", "one", "two"]),
-            owned(&["second", "one", "two", "three"]),
-            owned(&["second", "one", "two", "three", "four"]),
+            owned(&["first", "second", "one"]),
+            owned(&["first", "second", "one", "two"]),
+            owned(&["first", "second", "one", "two", "three"]),
+            owned(&["first", "second", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -324,16 +279,16 @@ mod tests {
             let c = captured_second.expect("subcommand should have run");
             assert_eq!(
                 c,
-                &a[1..],
+                &a[2..],
                 "arguments after the name of the subcommand must be passed to the subcommand"
             );
         }
 
         let args = vec![
-            owned(&["third", "one"]),
-            owned(&["third", "one", "two"]),
-            owned(&["third", "one", "two", "three"]),
-            owned(&["third", "one", "two", "three", "four"]),
+            owned(&["first", "third", "one"]),
+            owned(&["first", "third", "one", "two"]),
+            owned(&["first", "third", "one", "two", "three"]),
+            owned(&["first", "third", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -357,16 +312,16 @@ mod tests {
             let c = captured_third.expect("subcommand should have run");
             assert_eq!(
                 c,
-                &a[1..],
+                &a[2..],
                 "arguments after the name of the subcommand must be passed to the subcommand"
             );
         }
 
         let args = vec![
-            owned(&["fourth", "one"]),
-            owned(&["fourth", "one", "two"]),
-            owned(&["fourth", "one", "two", "three"]),
-            owned(&["fourth", "one", "two", "three", "four"]),
+            owned(&["first", "fourth", "one"]),
+            owned(&["first", "fourth", "one", "two"]),
+            owned(&["first", "fourth", "one", "two", "three"]),
+            owned(&["first", "fourth", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -390,25 +345,26 @@ mod tests {
             let c = captured_fourth.expect("subcommand should have run");
             assert_eq!(
                 c,
-                &a[1..],
+                &a[2..],
                 "arguments after the name of the subcommand must be passed to the subcommand"
             );
         }
 
         let args = vec![
-            owned(&[]),
-            owned(&["one"]),
-            owned(&["one", "two"]),
-            owned(&["one", "two", "three"]),
-            owned(&["one", "two", "three", "four"]),
+            owned(&["first"]),
+            owned(&["first", "one"]),
+            owned(&["first", "one", "two"]),
+            owned(&["first", "one", "two", "three"]),
+            owned(&["first", "one", "two", "three", "four"]),
         ];
 
         for a in args {
             let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
 
+            let c = captured_first.expect("first command should have run");
             assert_eq!(
-                captured_first,
-                Some(a),
+                c,
+                a[1..],
                 "all arguments should have been passed to first command"
             );
 
@@ -437,13 +393,13 @@ mod tests {
             let mut captured_third: Option<Vec<String>> = None;
             let mut captured_fourth: Option<Vec<String>> = None;
 
-            App::new("first")
+            Cmd::root("first")
                 .run(|a| captured_first = Some(a.to_vec()))
-                .sub(
+                .subcommand(
                     Cmd::new("second")
                         .run(|a| captured_second = Some(a.to_vec()))
-                        .sub(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
-                        .sub(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec()))),
+                        .subcommand(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
+                        .subcommand(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec()))),
                 )
                 .execute_with(args);
 
@@ -456,10 +412,10 @@ mod tests {
         };
 
         let args = vec![
-            owned(&["second", "third", "one"]),
-            owned(&["second", "third", "one", "two"]),
-            owned(&["second", "third", "one", "two", "three"]),
-            owned(&["second", "third", "one", "two", "three", "four"]),
+            owned(&["first", "second", "third", "one"]),
+            owned(&["first", "second", "third", "one", "two"]),
+            owned(&["first", "second", "third", "one", "two", "three"]),
+            owned(&["first", "second", "third", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -480,16 +436,16 @@ mod tests {
             let c = captured_third.expect("subcommand should have run");
             assert_eq!(
                 c,
-                &a[2..],
+                &a[3..],
                 "arguments after the name of the subcommand must be passed to the subcommand"
             );
         }
 
         let args = vec![
-            owned(&["second", "fourth", "one"]),
-            owned(&["second", "fourth", "one", "two"]),
-            owned(&["second", "fourth", "one", "two", "three"]),
-            owned(&["second", "fourth", "one", "two", "three", "four"]),
+            owned(&["first", "second", "fourth", "one"]),
+            owned(&["first", "second", "fourth", "one", "two"]),
+            owned(&["first", "second", "fourth", "one", "two", "three"]),
+            owned(&["first", "second", "fourth", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -510,16 +466,16 @@ mod tests {
             let c = captured_fourth.expect("subcommand should have run");
             assert_eq!(
                 c,
-                &a[2..],
+                &a[3..],
                 "arguments after the name of the subcommand must be passed to the subcommand"
             );
         }
 
         let args = vec![
-            owned(&["second", "one"]),
-            owned(&["second", "one", "two"]),
-            owned(&["second", "one", "two", "three"]),
-            owned(&["second", "one", "two", "three", "four"]),
+            owned(&["first", "second", "one"]),
+            owned(&["first", "second", "one", "two"]),
+            owned(&["first", "second", "one", "two", "three"]),
+            owned(&["first", "second", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -540,17 +496,17 @@ mod tests {
             let c = captured_second.expect("subcommand should have run");
             assert_eq!(
                 c,
-                &a[1..],
+                &a[2..],
                 "arguments after the name of the subcommand must be passed to the subcommand"
             );
         }
 
         let args = vec![
-            owned(&[]),
-            owned(&["one"]),
-            owned(&["one", "two"]),
-            owned(&["one", "two", "three"]),
-            owned(&["one", "two", "three", "four"]),
+            owned(&["first"]),
+            owned(&["first", "one"]),
+            owned(&["first", "one", "two"]),
+            owned(&["first", "one", "two", "three"]),
+            owned(&["first", "one", "two", "three", "four"]),
         ];
 
         for a in args {
@@ -568,9 +524,11 @@ mod tests {
                 captured_fourth.is_none(),
                 "should not have run the fourth subcommand"
             );
+
+            let c = captured_first.expect("first command should have run");
             assert_eq!(
-                captured_first,
-                Some(a),
+                c,
+                a[1..],
                 "all arguments should have been passed to first command"
             );
         }

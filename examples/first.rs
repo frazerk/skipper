@@ -3,15 +3,15 @@ use skipper::*;
 fn main() {
     let mut a = 1;
 
-    App::new("first")
+    Cmd::root("first")
         .run(first)
-        .sub(
+        .subcommand(
             Cmd::new("second")
                 .run(|i| {
                     a += 1;
                     println!("2 {} {}", i.join("/"), a)
                 })
-                .sub(Cmd::new("third").run(|i| println!("3 {}", i.join("-")))),
+                .subcommand(Cmd::new("third").run(|i| println!("3 {}", i.join("-")))),
         )
         .execute();
 }
