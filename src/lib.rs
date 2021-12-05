@@ -23,12 +23,13 @@ struct Data<'a> {
 
     // TODO: this is ugly as sin
     root: bool,
+
+    sub: Vec<Data<'a>>,
 }
 
 pub struct Cmd<'a, F, N> {
-    run: F,
-    next: N,
     data: Data<'a>,
+    tree: CmdTree<'a, F, N>,
 }
 
 impl<'a, F, N> Cmd<'a, F, N> {
@@ -37,20 +38,31 @@ impl<'a, F, N> Cmd<'a, F, N> {
         G: FnMut(&Args),
     {
         Cmd {
-            run,
-            next: self.next,
+            tree: CmdTree {
+                run,
+                name: self.tree.name,
+                next: self.tree.next,
+            },
             data: self.data,
         }
     }
 
     // TODO: find shorter name (sub conflicts with common trait)
-    pub fn subcommand<V: Visitor>(self, sub: V) -> Cmd<'a, F, Chain<V, N>> {
+    pub fn subcmd<G, V>(mut self, sub: Cmd<'a, G, V>) -> Cmd<'a, F, Chain<CmdTree<G, V>, N>>
+    where
+        G: FnMut(&Args),
+    {
+        self.data.sub.push(sub.data);
+
         Cmd {
-            next: Chain {
-                cur: sub,
-                next: self.next,
+            tree: CmdTree {
+                name: self.tree.name,
+                run: self.tree.run,
+                next: Chain {
+                    cur: sub.tree,
+                    next: self.tree.next,
+                },
             },
-            run: self.run,
             data: self.data,
         }
     }
@@ -82,8 +94,8 @@ where
     fn exec(&mut self, args: &Args) -> bool {
         match self.check_run(args) {
             Some(args) => {
-                if !self.next.exec(args) {
-                    (self.run)(args);
+                if !self.tree.next.exec(args) {
+                    (self.tree.run)(args);
                 }
                 true
             }
@@ -99,7 +111,7 @@ where
     fn exec(&mut self, args: &Args) -> bool {
         match self.check_run(args) {
             Some(args) => {
-                (self.run)(args);
+                (self.tree.run)(args);
                 true
             }
             None => false,
@@ -114,7 +126,7 @@ where
     fn exec(&mut self, args: &Args) -> bool {
         match self.check_run(args) {
             Some(args) => {
-                self.next.exec(args);
+                self.tree.next.exec(args);
                 true
             }
             None => false,
@@ -129,34 +141,31 @@ impl<'a> Visitor for Cmd<'a, (), ()> {
 }
 
 impl<'a> Cmd<'a, (), ()> {
-    pub fn new(name: &'a str) -> Self {
+    fn build(name: &'a str, root: bool) -> Self {
         Self {
-            run: (),
-            next: (),
+            tree: CmdTree {
+                name,
+                run: (),
+                next: (),
+            },
             data: Data {
                 name,
+                root,
                 ..Data::default()
             },
         }
+    }
+
+    pub fn new(name: &'a str) -> Self {
+        Self::build(name, false)
     }
 
     pub fn root(name: &'a str) -> Self {
-        Self {
-            run: (),
-            next: (),
-            data: Data {
-                name,
-                root: true,
-                ..Data::default()
-            },
-        }
+        Self::build(name, true)
     }
 }
 
-pub struct Chain<C, N>
-where
-    C: Visitor,
-{
+pub struct Chain<C, N> {
     cur: C,
     next: N,
 }
@@ -181,6 +190,81 @@ where
 {
     fn exec(&mut self, args: &Args) -> bool {
         self.cur.exec(args)
+    }
+}
+
+pub struct CmdTree<'a, F, N> {
+    name: &'a str,
+    run: F,
+    next: N,
+}
+
+impl<'a, F, N> CmdTree<'a, F, N> {
+    fn check_run<'b>(&self, args: &'b Args) -> Option<&'b Args> {
+        match args {
+            [] => None,
+            [first, a @ ..] => {
+                if first == self.name {
+                    Some(a)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+impl<'a, F, N> Visitor for CmdTree<'a, F, N>
+where
+    F: FnMut(&Args), // TODO: can we get this to be FnOnce?
+    N: Visitor,
+{
+    fn exec(&mut self, args: &Args) -> bool {
+        match self.check_run(args) {
+            Some(args) => {
+                if !self.next.exec(args) {
+                    (self.run)(args);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl<'a, F> Visitor for CmdTree<'a, F, ()>
+where
+    F: FnMut(&Args), // TODO: can we get this to be FnOnce?,
+{
+    fn exec(&mut self, args: &Args) -> bool {
+        match self.check_run(args) {
+            Some(args) => {
+                (self.run)(args);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl<'a, N> Visitor for CmdTree<'a, (), N>
+where
+    N: Visitor,
+{
+    fn exec(&mut self, args: &Args) -> bool {
+        match self.check_run(args) {
+            Some(args) => {
+                self.next.exec(args);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl<'a> Visitor for CmdTree<'a, (), ()> {
+    fn exec(&mut self, args: &Args) -> bool {
+        self.check_run(args).is_some()
     }
 }
 
@@ -238,9 +322,9 @@ mod tests {
 
             Cmd::root("first")
                 .run(|a| captured_first = Some(a.to_vec()))
-                .subcommand(Cmd::new("second").run(|a| captured_second = Some(a.to_vec())))
-                .subcommand(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
-                .subcommand(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec())))
+                .subcmd(Cmd::new("second").run(|a| captured_second = Some(a.to_vec())))
+                .subcmd(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
+                .subcmd(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec())))
                 .execute_with(args);
 
             (
@@ -395,11 +479,11 @@ mod tests {
 
             Cmd::root("first")
                 .run(|a| captured_first = Some(a.to_vec()))
-                .subcommand(
+                .subcmd(
                     Cmd::new("second")
                         .run(|a| captured_second = Some(a.to_vec()))
-                        .subcommand(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
-                        .subcommand(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec()))),
+                        .subcmd(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
+                        .subcmd(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec()))),
                 )
                 .execute_with(args);
 

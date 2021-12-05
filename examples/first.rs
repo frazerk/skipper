@@ -5,13 +5,13 @@ fn main() {
 
     Cmd::root("first")
         .run(first)
-        .subcommand(
+        .subcmd(
             Cmd::new("second")
                 .run(|i| {
                     a += 1;
                     println!("2 {} {}", i.join("/"), a)
                 })
-                .subcommand(Cmd::new("third").run(|i| println!("3 {}", i.join("-")))),
+                .subcmd(Cmd::new("third").run(|i| println!("3 {}", i.join("-")))),
         )
         .execute();
 }
