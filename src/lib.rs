@@ -1,4 +1,7 @@
+use once_cell::sync::Lazy;
 use std::env;
+
+static ARGS: Lazy<Vec<String>> = Lazy::new(|| std::env::args().collect());
 
 type Args = [String];
 
@@ -7,8 +10,73 @@ pub trait Visitor {
     fn exec(self, args: &Args) -> bool;
 }
 
+// TODO: figure out how to remove duplication or simplify forwarding to Cmd
+pub struct App<'a, F, N> {
+    cmd: Cmd<'a, F, N>,
+}
+
+impl<'a> App<'a, (), Leaf> {
+    pub fn new(name: &'a str) -> Self {
+        Self {
+            cmd: Cmd::root2(name, ARGS.as_slice()),
+        }
+    }
+}
+
+impl<'a, N> App<'a, (), N> {
+    pub fn run<F>(self, run: F) -> App<'a, F, N>
+    where
+        F: FnOnce(&Args),
+    {
+        App {
+            cmd: self.cmd.run(run),
+        }
+    }
+}
+
+impl<'a, F, N> App<'a, F, N> {
+    pub fn sub2<T, G, V>(self, name: &'a str, sub: T) -> App<'a, F, Chain<CmdTree<'a, G, V>, N>>
+    where
+        T: FnOnce(Cmd<'a, (), Leaf>) -> Cmd<'a, G, V>,
+    {
+        App {
+            cmd: self.cmd.sub2(name, sub),
+        }
+    }
+}
+
+impl<'a, F, N> App<'a, F, N>
+where
+    CmdTree<'a, F, N>: Visitor,
+    F: FnOnce(&Args), // TODO: this constraint will cause problems
+    N: Visitor,
+{
+    pub fn execute(self) {
+        self.execute_with(&ARGS)
+    }
+
+    pub fn execute_with(self, args: &Args) {
+        let mut run_help = false;
+        let ran;
+
+        let data = {
+            let c = self.cmd.subcmd(Cmd::new("help").run(|_| run_help = true));
+            ran = c.tree.exec(args);
+            c.data
+        };
+
+        if !ran || run_help {
+            println!("{:#?}", data);
+        }
+    }
+}
+
+// TODO: more specific name
 #[derive(Default, Debug)]
 struct Data<'a> {
+    // TODO: should this be in Data or Cmd?
+    args: &'a Args,
+
     name: &'a str,
     description: Option<&'a str>,
 
@@ -28,6 +96,7 @@ pub struct Cmd<'a, F, N> {
     tree: CmdTree<'a, F, N>,
 }
 
+// TODO: delete this impl block, execute is on App now
 impl<'a, F, N> Cmd<'a, F, N>
 where
     CmdTree<'a, F, N>: Visitor,
@@ -46,7 +115,7 @@ where
 
         let data = {
             let c = self.subcmd(Cmd::new("help").run(|_| run_help = true));
-            ran = !c.tree.exec(args);
+            ran = c.tree.exec(args);
             c.data
         };
 
@@ -79,6 +148,45 @@ impl<'a, F, N> Cmd<'a, F, N> {
         }
     }
 
+    pub fn flag(mut self, name: &str, value: &mut u32) -> Self {
+        match self.data.args {
+            [first, second, a @ ..] => {
+                if first == name {
+                    match second.parse::<u32>() {
+                        Ok(i) => {
+                            self.data.args = a;
+                            *value = i;
+                            self
+                        }
+                        Err(_) => self,
+                    }
+                } else {
+                    self
+                }
+            }
+            _ => self,
+        }
+    }
+
+    pub fn sub2<T, G, V>(mut self, name: &'a str, sub: T) -> Cmd<'a, F, Chain<CmdTree<'a, G, V>, N>>
+    where
+        T: FnOnce(Cmd<'a, (), Leaf>) -> Cmd<'a, G, V>,
+    {
+        let cmd = match self.data.args {
+            [] => Cmd::new2(name, &[]),
+            [_, a @ ..] => Cmd::new2(name, a),
+        };
+
+        let sub = (sub)(cmd);
+
+        self.data.sub.push(sub.data);
+
+        Cmd {
+            tree: self.tree.chain(sub.tree),
+            data: self.data,
+        }
+    }
+
     pub fn description(mut self, description: &'a str) -> Self {
         self.data.description = Some(description);
         self
@@ -86,7 +194,7 @@ impl<'a, F, N> Cmd<'a, F, N> {
 }
 
 impl<'a> Cmd<'a, (), Leaf> {
-    fn build(name: &'a str, root: bool) -> Self {
+    fn build(name: &'a str, root: bool, args: &'a Args) -> Self {
         Self {
             tree: CmdTree {
                 name,
@@ -96,17 +204,25 @@ impl<'a> Cmd<'a, (), Leaf> {
             },
             data: Data {
                 name,
+                args,
                 ..Data::default()
             },
         }
     }
 
+    pub fn new2(name: &'a str, args: &'a Args) -> Self {
+        Self::build(name, false, args)
+    }
+
     pub fn new(name: &'a str) -> Self {
-        Self::build(name, false)
+        Self::build(name, false, &[])
+    }
+    pub fn root2(name: &'a str, args: &'a Args) -> Self {
+        Self::build(name, true, args)
     }
 
     pub fn root(name: &'a str) -> Self {
-        Self::build(name, true)
+        Self::build(name, true, &[])
     }
 }
 
