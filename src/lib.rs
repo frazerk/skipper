@@ -1,160 +1,123 @@
-use once_cell::sync::Lazy;
-use std::env;
-
-static ARGS: Lazy<Vec<String>> = Lazy::new(|| std::env::args().collect());
-
 type Args = [String];
 
-pub trait Visitor {
-    // TODO: rename
-    fn exec(self, args: &Args) -> bool;
-}
-
 // TODO: figure out how to remove duplication or simplify forwarding to Cmd
-pub struct App<'a, F, N> {
-    cmd: Cmd<'a, F, N>,
+pub struct App<'a> {
+    cmd: Cmd<'a>,
 }
 
-impl<'a> App<'a, (), Leaf> {
+impl<'a> App<'a> {
     pub fn new(name: &'a str) -> Self {
+        Self::new_args(name, std::env::args())
+    }
+
+    // TODO: is there an IntoIter?
+    pub fn new_args(name: &'a str, args: impl Iterator<Item = String>) -> Self {
+        let args = args.skip(1).collect();
+
+        // TODO: probably want a new() for command
         Self {
-            cmd: Cmd::root2(name, ARGS.as_slice()),
+            cmd: Cmd {
+                args: Some(args),
+                data: Data {
+                    name,
+                    ..Data::default()
+                },
+            },
         }
     }
-}
 
-impl<'a, N> App<'a, (), N> {
-    pub fn run<F>(self, run: F) -> App<'a, F, N>
+    // TODO: what if there's not an action associated with the App?
+    pub fn run<F>(self, run: F)
     where
         F: FnOnce(&Args),
     {
-        App {
-            cmd: self.cmd.run(run),
-        }
-    }
-}
-
-impl<'a, F, N> App<'a, F, N> {
-    pub fn sub2<T, G, V>(self, name: &'a str, sub: T) -> App<'a, F, Chain<CmdTree<'a, G, V>, N>>
-    where
-        T: FnOnce(Cmd<'a, (), Leaf>) -> Cmd<'a, G, V>,
-    {
-        App {
-            cmd: self.cmd.sub2(name, sub),
-        }
-    }
-}
-
-impl<'a, F, N> App<'a, F, N>
-where
-    CmdTree<'a, F, N>: Visitor,
-    F: FnOnce(&Args), // TODO: this constraint will cause problems
-    N: Visitor,
-{
-    pub fn execute(self) {
-        self.execute_with(&ARGS)
-    }
-
-    pub fn execute_with(self, args: &Args) {
         let mut run_help = false;
-        let ran;
 
-        let data = {
-            let c = self.cmd.subcmd(Cmd::new("help").run(|_| run_help = true));
-            ran = c.tree.exec(args);
-            c.data
-        };
+        let app = self.subcmd("help", |help| help.run(|_| run_help = true));
+        let data = app.cmd.run(run);
 
-        if !ran || run_help {
+        if run_help {
             println!("{:#?}", data);
         }
+    }
+
+    pub fn subcmd<F>(mut self, name: &'a str, sub: F) -> Self
+    where
+        F: FnOnce(Cmd<'a>) -> Data<'a>,
+    {
+        self.cmd = self.cmd.subcmd(name, sub);
+        self
     }
 }
 
 // TODO: more specific name
 #[derive(Default, Debug)]
-struct Data<'a> {
-    // TODO: should this be in Data or Cmd?
-    args: &'a Args,
-
+pub struct Data<'a> {
     name: &'a str,
     description: Option<&'a str>,
-
     sub: Vec<Data<'a>>,
+
+    // TODO: is there a better way to do this?
+    // TODO: also implement detecting if commands actually ran
+    executed: bool,
 }
 
-pub struct Leaf;
-
-impl Visitor for Leaf {
-    fn exec(self, _: &Args) -> bool {
-        false
-    }
-}
-
-pub struct Cmd<'a, F, N> {
+pub struct Cmd<'a> {
+    args: Option<Vec<String>>,
     data: Data<'a>,
-    tree: CmdTree<'a, F, N>,
 }
 
-// TODO: delete this impl block, execute is on App now
-impl<'a, F, N> Cmd<'a, F, N>
-where
-    CmdTree<'a, F, N>: Visitor,
-    F: FnOnce(&Args), // TODO: this constraint will cause problems
-    N: Visitor,
-{
-    pub fn execute(self) {
-        let args: Vec<String> = env::args().collect();
-
-        self.execute_with(&args)
-    }
-
-    pub fn execute_with(self, args: &Args) {
-        let mut run_help = false;
-        let ran;
-
-        let data = {
-            let c = self.subcmd(Cmd::new("help").run(|_| run_help = true));
-            ran = c.tree.exec(args);
-            c.data
-        };
-
-        if !ran || run_help {
-            println!("{:#?}", data);
-        }
-    }
-}
-
-impl<'a, N> Cmd<'a, (), N> {
-    pub fn run<F>(self, run: F) -> Cmd<'a, F, N>
+impl<'a> Cmd<'a> {
+    pub fn run<F>(self, run: F) -> Data<'a>
     where
         F: FnOnce(&Args),
     {
-        Cmd {
-            tree: self.tree.run(run),
-            data: self.data,
+        if let Some(args) = self.args {
+            (run)(args.as_slice());
         }
+        self.data
     }
-}
 
-impl<'a, F, N> Cmd<'a, F, N> {
-    // TODO: find shorter name (sub conflicts with common trait)
-    pub fn subcmd<G, V>(mut self, sub: Cmd<'a, G, V>) -> Cmd<'a, F, Chain<CmdTree<G, V>, N>> {
-        self.data.sub.push(sub.data);
+    pub fn subcmd<F>(mut self, name: &'a str, sub: F) -> Self
+    where
+        F: FnOnce(Cmd<'a>) -> Data<'a>,
+    {
+        let data = Data {
+            name,
+            ..Data::default()
+        };
 
-        Cmd {
-            tree: self.tree.chain(sub.tree),
-            data: self.data,
-        }
+        let cmd = match self.args.as_deref() {
+            Some([first, ..]) if first == name => {
+                // TODO: find a more graceful way to do this
+                let args = self.args.take().map(|mut v| {
+                    v.remove(0);
+                    v
+                });
+                Cmd { args, data }
+            }
+            _ => Cmd { args: None, data },
+        };
+
+        let data = (sub)(cmd);
+
+        self.data.sub.push(data);
+
+        self
     }
 
     pub fn flag(mut self, name: &str, value: &mut u32) -> Self {
-        match self.data.args {
-            [first, second, a @ ..] => {
+        match self.args.as_deref() {
+            Some([first, second, ..]) => {
                 if first == name {
                     match second.parse::<u32>() {
                         Ok(i) => {
-                            self.data.args = a;
+                            // TODO: do this better
+                            self.args = self.args.map(|mut v| {
+                                v.remove(0);
+                                v.remove(0);
+                                v
+                            });
                             *value = i;
                             self
                         }
@@ -168,161 +131,9 @@ impl<'a, F, N> Cmd<'a, F, N> {
         }
     }
 
-    pub fn sub2<T, G, V>(mut self, name: &'a str, sub: T) -> Cmd<'a, F, Chain<CmdTree<'a, G, V>, N>>
-    where
-        T: FnOnce(Cmd<'a, (), Leaf>) -> Cmd<'a, G, V>,
-    {
-        let cmd = match self.data.args {
-            [] => Cmd::new2(name, &[]),
-            [_, a @ ..] => Cmd::new2(name, a),
-        };
-
-        let sub = (sub)(cmd);
-
-        self.data.sub.push(sub.data);
-
-        Cmd {
-            tree: self.tree.chain(sub.tree),
-            data: self.data,
-        }
-    }
-
     pub fn description(mut self, description: &'a str) -> Self {
         self.data.description = Some(description);
         self
-    }
-}
-
-impl<'a> Cmd<'a, (), Leaf> {
-    fn build(name: &'a str, root: bool, args: &'a Args) -> Self {
-        Self {
-            tree: CmdTree {
-                name,
-                root,
-                run: (),
-                next: Leaf,
-            },
-            data: Data {
-                name,
-                args,
-                ..Data::default()
-            },
-        }
-    }
-
-    pub fn new2(name: &'a str, args: &'a Args) -> Self {
-        Self::build(name, false, args)
-    }
-
-    pub fn new(name: &'a str) -> Self {
-        Self::build(name, false, &[])
-    }
-    pub fn root2(name: &'a str, args: &'a Args) -> Self {
-        Self::build(name, true, args)
-    }
-
-    pub fn root(name: &'a str) -> Self {
-        Self::build(name, true, &[])
-    }
-}
-
-pub struct Chain<C, N> {
-    cur: C,
-    next: N,
-}
-
-impl<C, N> Visitor for Chain<C, N>
-where
-    C: Visitor,
-    N: Visitor,
-{
-    fn exec(self, args: &Args) -> bool {
-        if self.cur.exec(args) {
-            true
-        } else {
-            self.next.exec(args)
-        }
-    }
-}
-
-pub struct CmdTree<'a, F, N> {
-    name: &'a str,
-    run: F,
-    next: N,
-
-    // TODO: get rid of this
-    root: bool,
-}
-
-impl<'a, F, N> CmdTree<'a, F, N> {
-    pub fn run<G>(self, run: G) -> CmdTree<'a, G, N>
-    where
-        G: FnOnce(&Args),
-    {
-        CmdTree {
-            run,
-            root: self.root,
-            name: self.name,
-            next: self.next,
-        }
-    }
-
-    pub fn chain<G, V>(self, sub: CmdTree<'a, G, V>) -> CmdTree<'a, F, Chain<CmdTree<G, V>, N>> {
-        CmdTree {
-            name: self.name,
-            run: self.run,
-            root: self.root,
-            next: Chain {
-                cur: sub,
-                next: self.next,
-            },
-        }
-    }
-
-    fn check_run<'b>(&self, args: &'b Args) -> Option<&'b Args> {
-        match args {
-            [] => None,
-            [first, a @ ..] => {
-                if first == self.name || self.root {
-                    Some(a)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-impl<'a, F, N> Visitor for CmdTree<'a, F, N>
-where
-    F: FnOnce(&Args), // TODO: can we get this to be FnOnce?
-    N: Visitor,
-{
-    fn exec(self, args: &Args) -> bool {
-        match self.check_run(args) {
-            Some(args) => {
-                if !self.next.exec(args) {
-                    (self.run)(args);
-                }
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-impl<'a, N> Visitor for CmdTree<'a, (), N>
-where
-    N: Visitor,
-{
-    fn exec(self, args: &Args) -> bool {
-        match self.check_run(args) {
-            Some(args) => {
-                self.next.exec(args);
-                true
-            }
-            None => false,
-        }
     }
 }
 
@@ -336,12 +147,10 @@ mod tests {
 
     #[test]
     fn no_subcommands_no_flags() {
-        let run = |args: &[String]| {
+        let run = |args: Vec<String>| {
             let mut captured: Option<Vec<String>> = None;
 
-            Cmd::root("first")
-                .run(|a| captured = Some(a.to_vec()))
-                .execute_with(args);
+            App::new_args("first", args.into_iter()).run(|a| captured = Some(a.to_vec()));
 
             captured
         };
@@ -356,7 +165,7 @@ mod tests {
 
         for a in args {
             // TODO: get rid of this clone
-            let captured = run(&a);
+            let captured = run(a.clone());
 
             // If we have a single command and no subcommands or flags, all arguments
             // must be passed to the top-level command.
@@ -372,18 +181,23 @@ mod tests {
 
     #[test]
     fn one_level_subcommands_no_flags() {
-        let run = |args: &[String]| {
+        let run = |args: Vec<String>| {
             let mut captured_first: Option<Vec<String>> = None;
             let mut captured_second: Option<Vec<String>> = None;
             let mut captured_third: Option<Vec<String>> = None;
             let mut captured_fourth: Option<Vec<String>> = None;
 
-            Cmd::root("first")
-                .run(|a| captured_first = Some(a.to_vec()))
-                .subcmd(Cmd::new("second").run(|a| captured_second = Some(a.to_vec())))
-                .subcmd(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
-                .subcmd(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec())))
-                .execute_with(args);
+            App::new_args("first", args.into_iter())
+                .subcmd("second", |second| {
+                    second.run(|a| captured_second = Some(a.to_vec()))
+                })
+                .subcmd("third", |third| {
+                    third.run(|a| captured_third = Some(a.to_vec()))
+                })
+                .subcmd("fourth", |fourth| {
+                    fourth.run(|a| captured_fourth = Some(a.to_vec()))
+                })
+                .run(|a| captured_first = Some(a.to_vec()));
 
             (
                 captured_first,
@@ -401,7 +215,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
                 captured_first.is_none(),
@@ -434,7 +248,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
                 captured_first.is_none(),
@@ -467,7 +281,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
                 captured_first.is_none(),
@@ -501,7 +315,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             let c = captured_first.expect("first command should have run");
             assert_eq!(
@@ -529,21 +343,24 @@ mod tests {
 
     #[test]
     fn two_level_subcommand_no_flags() {
-        let run = |args: &[String]| {
+        let run = |args: Vec<String>| {
             let mut captured_first: Option<Vec<String>> = None;
             let mut captured_second: Option<Vec<String>> = None;
             let mut captured_third: Option<Vec<String>> = None;
             let mut captured_fourth: Option<Vec<String>> = None;
 
-            Cmd::root("first")
-                .run(|a| captured_first = Some(a.to_vec()))
-                .subcmd(
-                    Cmd::new("second")
+            App::new_args("first", args.into_iter())
+                .subcmd("second", |second| {
+                    second
+                        .subcmd("third", |third| {
+                            third.run(|a| captured_third = Some(a.to_vec()))
+                        })
+                        .subcmd("fourth", |fourth| {
+                            fourth.run(|a| captured_fourth = Some(a.to_vec()))
+                        })
                         .run(|a| captured_second = Some(a.to_vec()))
-                        .subcmd(Cmd::new("third").run(|a| captured_third = Some(a.to_vec())))
-                        .subcmd(Cmd::new("fourth").run(|a| captured_fourth = Some(a.to_vec()))),
-                )
-                .execute_with(args);
+                })
+                .run(|a| captured_first = Some(a.to_vec()));
 
             (
                 captured_first,
@@ -561,7 +378,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
                 captured_first.is_none(),
@@ -591,7 +408,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
                 captured_first.is_none(),
@@ -621,7 +438,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
                 captured_first.is_none(),
@@ -652,7 +469,7 @@ mod tests {
         ];
 
         for a in args {
-            let (captured_first, captured_second, captured_third, captured_fourth) = run(&a);
+            let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
                 captured_second.is_none(),

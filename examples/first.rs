@@ -4,20 +4,25 @@ fn main() {
     let mut a = 1;
 
     App::new("first")
-        .run(first)
-        .sub2("second", |cmd| {
-            cmd.run(|i| {
-                a += 1;
-                println!("2 {} {}", i.join("/"), a)
-            })
-            .subcmd(Cmd::new("third").run(|i| println!("3 {}", i.join("-"))))
+        .subcmd("second", |second| {
+            second
+                .subcmd("third", |third| {
+                    third.run(|i| println!("3 {}", i.join("-")))
+                })
+                .run(|i| {
+                    a += 1;
+                    println!("2 {} {}", i.join("/"), a)
+                })
         })
-        .sub2("fourth", |cmd| {
-            let mut flag = 0;
-            cmd.flag("-t", &mut flag)
-                .run(move |i| println!("4 {} FLAG: {}", i.join("^"), flag))
+        .subcmd("fourth", |fourth| {
+            let mut flag1 = 0;
+            let mut flag2 = 0;
+            fourth
+                .flag("-t", &mut flag1)
+                .flag("-u", &mut flag2)
+                .run(|i| println!("4 {} FLAG1: {}, FLAG2: {}", i.join("^"), flag1, flag2))
         })
-        .execute();
+        .run(first);
 }
 
 fn first(args: &[String]) {
