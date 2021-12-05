@@ -4,27 +4,23 @@ type Args = [String];
 
 pub trait Visitor {
     // TODO: rename
-    fn exec(&mut self, args: &Args) -> bool;
-
-    fn execute(&mut self) {
-        let args: Vec<String> = env::args().collect();
-        self.execute_with(&args)
-    }
-
-    fn execute_with(&mut self, args: &Args) {
-        self.exec(args);
-    }
+    fn exec(self, args: &Args) -> bool;
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Data<'a> {
     name: &'a str,
     description: Option<&'a str>,
 
-    // TODO: this is ugly as sin
-    root: bool,
-
     sub: Vec<Data<'a>>,
+}
+
+pub struct Leaf;
+
+impl Visitor for Leaf {
+    fn exec(self, _: &Args) -> bool {
+        false
+    }
 }
 
 pub struct Cmd<'a, F, N> {
@@ -32,37 +28,53 @@ pub struct Cmd<'a, F, N> {
     tree: CmdTree<'a, F, N>,
 }
 
-impl<'a, F, N> Cmd<'a, F, N> {
-    pub fn run<G>(self, run: G) -> Cmd<'a, G, N>
+impl<'a, F, N> Cmd<'a, F, N>
+where
+    CmdTree<'a, F, N>: Visitor,
+    F: FnOnce(&Args), // TODO: this constraint will cause problems
+    N: Visitor,
+{
+    pub fn execute(self) {
+        let args: Vec<String> = env::args().collect();
+
+        self.execute_with(&args)
+    }
+
+    pub fn execute_with(self, args: &Args) {
+        let mut run_help = false;
+        let ran;
+
+        let data = {
+            let c = self.subcmd(Cmd::new("help").run(|_| run_help = true));
+            ran = !c.tree.exec(args);
+            c.data
+        };
+
+        if !ran || run_help {
+            println!("{:#?}", data);
+        }
+    }
+}
+
+impl<'a, N> Cmd<'a, (), N> {
+    pub fn run<F>(self, run: F) -> Cmd<'a, F, N>
     where
-        G: FnMut(&Args),
+        F: FnOnce(&Args),
     {
         Cmd {
-            tree: CmdTree {
-                run,
-                name: self.tree.name,
-                next: self.tree.next,
-            },
+            tree: self.tree.run(run),
             data: self.data,
         }
     }
+}
 
+impl<'a, F, N> Cmd<'a, F, N> {
     // TODO: find shorter name (sub conflicts with common trait)
-    pub fn subcmd<G, V>(mut self, sub: Cmd<'a, G, V>) -> Cmd<'a, F, Chain<CmdTree<G, V>, N>>
-    where
-        G: FnMut(&Args),
-    {
+    pub fn subcmd<G, V>(mut self, sub: Cmd<'a, G, V>) -> Cmd<'a, F, Chain<CmdTree<G, V>, N>> {
         self.data.sub.push(sub.data);
 
         Cmd {
-            tree: CmdTree {
-                name: self.tree.name,
-                run: self.tree.run,
-                next: Chain {
-                    cur: sub.tree,
-                    next: self.tree.next,
-                },
-            },
+            tree: self.tree.chain(sub.tree),
             data: self.data,
         }
     }
@@ -71,86 +83,19 @@ impl<'a, F, N> Cmd<'a, F, N> {
         self.data.description = Some(description);
         self
     }
-
-    fn check_run<'b>(&self, args: &'b Args) -> Option<&'b Args> {
-        match args {
-            [] => None,
-            [first, a @ ..] => {
-                if first == self.data.name || self.data.root {
-                    Some(a)
-                } else {
-                    None
-                }
-            }
-        }
-    }
 }
 
-impl<'a, F, N> Visitor for Cmd<'a, F, N>
-where
-    F: FnMut(&Args), // TODO: can we get this to be FnOnce?
-    N: Visitor,
-{
-    fn exec(&mut self, args: &Args) -> bool {
-        match self.check_run(args) {
-            Some(args) => {
-                if !self.tree.next.exec(args) {
-                    (self.tree.run)(args);
-                }
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-impl<'a, F> Visitor for Cmd<'a, F, ()>
-where
-    F: FnMut(&Args), // TODO: can we get this to be FnOnce?,
-{
-    fn exec(&mut self, args: &Args) -> bool {
-        match self.check_run(args) {
-            Some(args) => {
-                (self.tree.run)(args);
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-impl<'a, N> Visitor for Cmd<'a, (), N>
-where
-    N: Visitor,
-{
-    fn exec(&mut self, args: &Args) -> bool {
-        match self.check_run(args) {
-            Some(args) => {
-                self.tree.next.exec(args);
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-impl<'a> Visitor for Cmd<'a, (), ()> {
-    fn exec(&mut self, args: &Args) -> bool {
-        self.check_run(args).is_some()
-    }
-}
-
-impl<'a> Cmd<'a, (), ()> {
+impl<'a> Cmd<'a, (), Leaf> {
     fn build(name: &'a str, root: bool) -> Self {
         Self {
             tree: CmdTree {
                 name,
+                root,
                 run: (),
-                next: (),
+                next: Leaf,
             },
             data: Data {
                 name,
-                root,
                 ..Data::default()
             },
         }
@@ -175,7 +120,7 @@ where
     C: Visitor,
     N: Visitor,
 {
-    fn exec(&mut self, args: &Args) -> bool {
+    fn exec(self, args: &Args) -> bool {
         if self.cur.exec(args) {
             true
         } else {
@@ -184,27 +129,45 @@ where
     }
 }
 
-impl<C> Visitor for Chain<C, ()>
-where
-    C: Visitor,
-{
-    fn exec(&mut self, args: &Args) -> bool {
-        self.cur.exec(args)
-    }
-}
-
 pub struct CmdTree<'a, F, N> {
     name: &'a str,
     run: F,
     next: N,
+
+    // TODO: get rid of this
+    root: bool,
 }
 
 impl<'a, F, N> CmdTree<'a, F, N> {
+    pub fn run<G>(self, run: G) -> CmdTree<'a, G, N>
+    where
+        G: FnOnce(&Args),
+    {
+        CmdTree {
+            run,
+            root: self.root,
+            name: self.name,
+            next: self.next,
+        }
+    }
+
+    pub fn chain<G, V>(self, sub: CmdTree<'a, G, V>) -> CmdTree<'a, F, Chain<CmdTree<G, V>, N>> {
+        CmdTree {
+            name: self.name,
+            run: self.run,
+            root: self.root,
+            next: Chain {
+                cur: sub,
+                next: self.next,
+            },
+        }
+    }
+
     fn check_run<'b>(&self, args: &'b Args) -> Option<&'b Args> {
         match args {
             [] => None,
             [first, a @ ..] => {
-                if first == self.name {
+                if first == self.name || self.root {
                     Some(a)
                 } else {
                     None
@@ -216,10 +179,10 @@ impl<'a, F, N> CmdTree<'a, F, N> {
 
 impl<'a, F, N> Visitor for CmdTree<'a, F, N>
 where
-    F: FnMut(&Args), // TODO: can we get this to be FnOnce?
+    F: FnOnce(&Args), // TODO: can we get this to be FnOnce?
     N: Visitor,
 {
-    fn exec(&mut self, args: &Args) -> bool {
+    fn exec(self, args: &Args) -> bool {
         match self.check_run(args) {
             Some(args) => {
                 if !self.next.exec(args) {
@@ -232,26 +195,11 @@ where
     }
 }
 
-impl<'a, F> Visitor for CmdTree<'a, F, ()>
-where
-    F: FnMut(&Args), // TODO: can we get this to be FnOnce?,
-{
-    fn exec(&mut self, args: &Args) -> bool {
-        match self.check_run(args) {
-            Some(args) => {
-                (self.run)(args);
-                true
-            }
-            None => false,
-        }
-    }
-}
-
 impl<'a, N> Visitor for CmdTree<'a, (), N>
 where
     N: Visitor,
 {
-    fn exec(&mut self, args: &Args) -> bool {
+    fn exec(self, args: &Args) -> bool {
         match self.check_run(args) {
             Some(args) => {
                 self.next.exec(args);
@@ -259,12 +207,6 @@ where
             }
             None => false,
         }
-    }
-}
-
-impl<'a> Visitor for CmdTree<'a, (), ()> {
-    fn exec(&mut self, args: &Args) -> bool {
-        self.check_run(args).is_some()
     }
 }
 
