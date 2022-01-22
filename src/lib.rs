@@ -1,27 +1,29 @@
+use std::slice;
+
 type Args = [String];
 
 // TODO: figure out how to remove duplication or simplify forwarding to Cmd
-pub struct App<'a> {
-    cmd: Cmd<'a>,
+pub struct App<'data> {
+    args: Vec<String>,
+    data: Data<'data>,
 }
 
-impl<'a> App<'a> {
-    pub fn new(name: &'a str) -> Self {
+impl<'data> App<'data> {
+    pub fn new(name: &'data str) -> Self {
         Self::new_args(name, std::env::args())
     }
 
     // TODO: is there an IntoIter?
-    pub fn new_args(name: &'a str, args: impl Iterator<Item = String>) -> Self {
+    pub fn new_args(name: &'data str, args: impl Iterator<Item = String>) -> Self {
         let args = args.skip(1).collect();
 
         // TODO: probably want a new() for command
         Self {
-            cmd: Cmd {
-                args: Some(args),
-                data: Data {
-                    name,
-                    ..Data::default()
-                },
+            args,
+            data: Data {
+                name,
+                matched: true,
+                ..Data::default()
             },
         }
     }
@@ -33,92 +35,119 @@ impl<'a> App<'a> {
     {
         let mut run_help = false;
 
-        let app = self.subcmd("help", |help| help.run(|_| run_help = true));
-        let data = app.cmd.run(run);
+        let mut app = self.subcmd(|sub| sub.name("help").run(|_| run_help = true));
+
+        app.data.run(app.args.as_slice(), run);
 
         if run_help {
-            println!("{:#?}", data);
+            println!("{:#?}", app.data);
         }
     }
 
-    pub fn subcmd<F>(mut self, name: &'a str, sub: F) -> Self
+    pub fn subcmd<F>(mut self, sub: F) -> Self
     where
-        F: FnOnce(Cmd<'a>) -> Data<'a>,
+        F: for<'a> FnOnce(NewCmd<'a>) -> Data<'data>,
     {
-        self.cmd = self.cmd.subcmd(name, sub);
+        self.data.subcmd(&self.args, sub);
         self
     }
 }
 
 // TODO: more specific name
+// TODO: this lifetime is kind of awkward
 #[derive(Default, Debug)]
 pub struct Data<'a> {
     name: &'a str,
     description: Option<&'a str>,
     sub: Vec<Data<'a>>,
+    subtree_ran: bool,
 
     // TODO: is there a better way to do this?
-    // TODO: also implement detecting if commands actually ran
-    executed: bool,
+    matched: bool,
 }
 
-pub struct Cmd<'a> {
-    args: Option<Vec<String>>,
-    data: Data<'a>,
-}
-
-impl<'a> Cmd<'a> {
-    pub fn run<F>(self, run: F) -> Data<'a>
+impl<'a> Data<'a> {
+    pub fn run<F>(&mut self, args: &Args, run: F)
     where
         F: FnOnce(&Args),
     {
-        if let Some(args) = self.args {
-            (run)(args.as_slice());
+        if self.matched && !self.subtree_ran {
+            eprintln!("{} running", self.name);
+            (run)(args);
+            self.subtree_ran = true;
+        } else {
+            eprintln!("{} not running", self.name);
         }
+    }
+
+    pub fn subcmd<F>(&mut self, args: &Args, sub: F)
+    where
+        F: for<'b> FnOnce(NewCmd<'b>) -> Data<'a>,
+    {
+        let cmd = NewCmd { args: args.iter() };
+        let data = (sub)(cmd);
+
+        self.subtree_ran |= data.subtree_ran;
+        self.sub.push(data);
+    }
+}
+
+// TODO: rename this, probably should just be Cmd, and Cmd should be something else
+pub struct NewCmd<'args> {
+    args: slice::Iter<'args, String>,
+}
+
+impl<'args> NewCmd<'args> {
+    pub fn name(mut self, name: &str) -> Cmd<'args, '_> {
+        let matched = matches!(self.args.next(), Some(next) if next == name);
+
+        Cmd {
+            args: self.args,
+            data: Data {
+                name,
+                matched,
+                ..Data::default()
+            },
+        }
+    }
+}
+
+pub struct Cmd<'args, 'data> {
+    args: slice::Iter<'args, String>,
+    data: Data<'data>,
+}
+
+impl<'args, 'data> Cmd<'args, 'data> {
+    pub fn run<F>(mut self, run: F) -> Data<'data>
+    where
+        F: FnOnce(&Args),
+    {
+        self.data.run(self.args.as_slice(), run);
         self.data
     }
 
-    pub fn subcmd<F>(mut self, name: &'a str, sub: F) -> Self
+    pub fn subcmd<F>(mut self, sub: F) -> Self
     where
-        F: FnOnce(Cmd<'a>) -> Data<'a>,
+        F: for<'a> FnOnce(NewCmd<'a>) -> Data<'data>,
     {
-        let data = Data {
-            name,
-            ..Data::default()
-        };
-
-        let cmd = match self.args.as_deref() {
-            Some([first, ..]) if first == name => {
-                // TODO: find a more graceful way to do this
-                let args = self.args.take().map(|mut v| {
-                    v.remove(0);
-                    v
-                });
-                Cmd { args, data }
-            }
-            _ => Cmd { args: None, data },
-        };
-
-        let data = (sub)(cmd);
-
-        self.data.sub.push(data);
+        // TODO: this clone is cheap, right?
+        self.data.subcmd(self.args.as_slice(), sub);
 
         self
     }
 
     pub fn flag(mut self, name: &str, value: &mut u32) -> Self {
-        match self.args.as_deref() {
-            Some([first, second, ..]) => {
+        match self.args.as_slice() {
+            [first, second, ..] => {
                 if first == name {
                     match second.parse::<u32>() {
                         Ok(i) => {
-                            // TODO: do this better
-                            self.args = self.args.map(|mut v| {
-                                v.remove(0);
-                                v.remove(0);
-                                v
-                            });
                             *value = i;
+
+                            // TODO: do this better
+                            self.args.next();
+                            self.args.next();
+
                             self
                         }
                         Err(_) => self,
@@ -131,7 +160,7 @@ impl<'a> Cmd<'a> {
         }
     }
 
-    pub fn description(mut self, description: &'a str) -> Self {
+    pub fn description(mut self, description: &'data str) -> Self {
         self.data.description = Some(description);
         self
     }
@@ -182,20 +211,22 @@ mod tests {
     #[test]
     fn one_level_subcommands_no_flags() {
         let run = |args: Vec<String>| {
+            eprintln!("args: {args:?}");
+
             let mut captured_first: Option<Vec<String>> = None;
             let mut captured_second: Option<Vec<String>> = None;
             let mut captured_third: Option<Vec<String>> = None;
             let mut captured_fourth: Option<Vec<String>> = None;
 
             App::new_args("first", args.into_iter())
-                .subcmd("second", |second| {
-                    second.run(|a| captured_second = Some(a.to_vec()))
+                .subcmd(|cmd| {
+                    cmd.name("second")
+                        .run(|a| captured_second = Some(a.to_vec()))
                 })
-                .subcmd("third", |third| {
-                    third.run(|a| captured_third = Some(a.to_vec()))
-                })
-                .subcmd("fourth", |fourth| {
-                    fourth.run(|a| captured_fourth = Some(a.to_vec()))
+                .subcmd(|cmd| cmd.name("third").run(|a| captured_third = Some(a.to_vec())))
+                .subcmd(|cmd| {
+                    cmd.name("fourth")
+                        .run(|a| captured_fourth = Some(a.to_vec()))
                 })
                 .run(|a| captured_first = Some(a.to_vec()));
 
@@ -350,13 +381,12 @@ mod tests {
             let mut captured_fourth: Option<Vec<String>> = None;
 
             App::new_args("first", args.into_iter())
-                .subcmd("second", |second| {
-                    second
-                        .subcmd("third", |third| {
-                            third.run(|a| captured_third = Some(a.to_vec()))
-                        })
-                        .subcmd("fourth", |fourth| {
-                            fourth.run(|a| captured_fourth = Some(a.to_vec()))
+                .subcmd(|cmd| {
+                    cmd.name("second")
+                        .subcmd(|cmd| cmd.name("third").run(|a| captured_third = Some(a.to_vec())))
+                        .subcmd(|cmd| {
+                            cmd.name("fourth")
+                                .run(|a| captured_fourth = Some(a.to_vec()))
                         })
                         .run(|a| captured_second = Some(a.to_vec()))
                 })
@@ -378,6 +408,7 @@ mod tests {
         ];
 
         for a in args {
+            eprintln!("testing with {:?}", a);
             let (captured_first, captured_second, captured_third, captured_fourth) = run(a.clone());
 
             assert!(
