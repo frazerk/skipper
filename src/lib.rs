@@ -1,6 +1,14 @@
 use std::slice;
 
-type Args = [String];
+// TODO:
+// - should we exit immediately after a command runs?
+//
+// - features
+//   - flag parsing
+//   - static autocompletion
+//   - dynamic autocompletion
+
+pub type Args = [String];
 
 // TODO: figure out how to remove duplication or simplify forwarding to Cmd
 pub struct App<'data> {
@@ -138,22 +146,18 @@ impl<'args, 'data> Cmd<'args, 'data> {
 
     pub fn flag(mut self, name: &str, value: &mut u32) -> Self {
         match self.args.as_slice() {
-            [first, second, ..] => {
-                if first == name {
-                    match second.parse::<u32>() {
-                        Ok(i) => {
-                            *value = i;
+            [first, second, ..] if first == name => {
+                match second.parse::<u32>() {
+                    Ok(i) => {
+                        *value = i;
 
-                            // TODO: do this better
-                            self.args.next();
-                            self.args.next();
+                        // TODO: do this better
+                        self.args.next();
+                        self.args.next();
 
-                            self
-                        }
-                        Err(_) => self,
+                        self
                     }
-                } else {
-                    self
+                    Err(_) => self,
                 }
             }
             _ => self,
