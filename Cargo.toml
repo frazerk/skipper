@@ -8,4 +8,22 @@ repository = "https://github.com/frazerk/skipper"
 readme = true
 
 [dependencies]
-once_cell = "1.5.2"
+boxed = { path = "./boxed" }
+boxed_btree = { path = "./boxed_btree" }
+boxed_sorted = { path = "./boxed_sorted" }
+boxed_vec = { path = "./boxed_vec" }
+tree = { path = "./tree" }
+
+[workspace]
+members = [
+	"boxed",
+	"boxed_btree",
+	"boxed_sorted",
+	"boxed_vec",
+	"tree",
+]
+
+[features]
+
+[dev-dependencies]
+clap = { version = "3.1.6", features = ["derive", "cargo"] }
