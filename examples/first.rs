@@ -2,34 +2,31 @@ use skipper::*;
 
 fn main() {
     App::new("first")
-        .subcmd(second)
-        .subcmd(|cmd| {
-            let mut flag1 = 0;
-            let mut flag2 = 0;
-            cmd.name("fourth")
+        .run(first)
+        .subcmd(second())
+        .subcmd(
+            Cmd::new("fourth")
                 .description("what's this? it must be the fourth subcommand")
-                .flag("-t", &mut flag1)
-                .flag("-u", &mut flag2)
-                .run(|i| println!("4 {} FLAG1: {}, FLAG2: {}", i.join("^"), flag1, flag2))
-        })
-        .run(first);
+                .run(|i| println!("4 {}", i.join("^"))),
+        )
+        .exec();
 }
 
 fn first(args: &Args) {
     println!("1 {}", args.join("+"));
 }
 
-fn second(cmd: NewCmd) -> Data<'static> {
+fn second() -> Cmd<'static> {
     let mut a = 1;
-    cmd.name("second")
+    Cmd::new("second")
         .description("hey, it's the second subcommand")
-        .subcmd(|cmd| {
-            cmd.name("third")
-                .description("oh dang dude this is the third subcommand")
-                .run(|i| println!("3 {}", i.join("-")))
-        })
-        .run(|i| {
+        .run(move |i| {
             a += 1;
             println!("2 {} {}", i.join("/"), a)
         })
+        .subcmd(
+            Cmd::new("third")
+                .description("oh dang dude this is the third subcommand")
+                .run(|i| println!("3 {}", i.join("-"))),
+        )
 }
